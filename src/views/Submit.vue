@@ -248,6 +248,10 @@ import {
 } from '../models/Constants.ts'
 import logger from '../utils/Logger.ts'
 import OcsResponse2Data from '../utils/OcsResponse2Data.ts'
+import {
+	normalizePrefillAnswers,
+	parsePrefillQuery,
+} from '../utils/PrefillAnswers.ts'
 import SetWindowTitle from '../utils/SetWindowTitle.ts'
 
 export default {
@@ -330,6 +334,10 @@ export default {
 			 * @type {Record<number, string[]>}
 			 */
 			answers: {},
+			/** Whether the user changed an answer after initialization */
+			answersDirty: false,
+			/** Prevent reapplying URL values after the user clears the form */
+			prefillDismissed: false,
 			loading: false,
 			success: false,
 			successAnnouncement: '',
@@ -504,6 +512,17 @@ export default {
 				|| loadState(appName, 'submissionId', null)
 			return id ? parseInt(id) : null
 		},
+
+		canLoadExistingSubmission() {
+			return (
+				this.isLoggedIn
+				&& this.submissionId
+				&& (this.form.allowEditSubmissions
+					|| this.form.permissions.includes(
+						this.PERMISSION_TYPES.PERMISSION_RESULTS_DELETE,
+					))
+			)
+		},
 	},
 
 	watch: {
@@ -523,7 +542,7 @@ export default {
 			}
 		},
 
-		hash() {
+		async hash() {
 			// If public view, abort. Should normally not occur.
 			if (this.publicView) {
 				logger.error('Hash changed on public view. Aborting.')
@@ -531,8 +550,11 @@ export default {
 			}
 			this.resetData()
 			// Fetch full form on change
-			this.fetchFullForm(this.form.id)
-			this.initFromLocalStorage()
+			await this.fetchFullForm(this.form.id)
+			this.initFromPrefill()
+			if (this.isLoggedIn) {
+				this.initFromLocalStorage()
+			}
 			SetWindowTitle(this.formTitle)
 		},
 	},
@@ -553,16 +575,14 @@ export default {
 			await this.fetchFullForm(this.form.id)
 		}
 
-		if (this.isLoggedIn) {
-			if (
-				this.submissionId
-				&& (this.form.allowEditSubmissions
-					|| this.form.permissions.includes(
-						this.PERMISSION_TYPES.PERMISSION_RESULTS_DELETE,
-					))
-			) {
-				this.fetchSubmission()
-			} else {
+		if (this.canLoadExistingSubmission) {
+			// URL prefill must never overwrite an existing submission.
+			await this.fetchSubmission()
+		} else {
+			// Apply the lower-priority URL values first, then let a saved draft
+			// overwrite answers for the same questions.
+			this.initFromPrefill()
+			if (this.isLoggedIn) {
 				this.initFromLocalStorage()
 			}
 		}
@@ -613,7 +633,24 @@ export default {
 					? answer.value.map(String)
 					: answer.value
 			}
-			this.answers = answers
+			this.answers = { ...this.answers, ...answers }
+		},
+
+		/**
+		 * Initialize answers from supported URL query parameters.
+		 */
+		initFromPrefill() {
+			if (this.prefillDismissed || this.submissionId) {
+				return
+			}
+
+			const rawPrefill = parsePrefillQuery(window.location.search)
+			const { answers } = normalizePrefillAnswers(
+				this.validQuestions,
+				rawPrefill,
+				this.maxStringLengths.answerText,
+			)
+			this.answers = { ...this.answers, ...answers }
 		},
 
 		/**
@@ -737,6 +774,7 @@ export default {
 				}
 
 				this.answers = answers
+				this.answersDirty = false
 			} catch (error) {
 				logger.error('Error while loading response', { error })
 				showError(
@@ -753,6 +791,7 @@ export default {
 		 */
 		onUpdate(question, values) {
 			this.answers = { ...this.answers, [question.id]: values }
+			this.answersDirty = true
 			this.addFormFieldToLocalStorage(question)
 		},
 
@@ -784,11 +823,7 @@ export default {
 		 * Methods for catching unwanted unload events
 		 */
 		beforeWindowUnload(e) {
-			if (
-				this.isActive
-				&& !this.submitForm
-				&& Object.keys(this.answers).length !== 0
-			) {
+			if (this.isActive && !this.submitForm && this.answersDirty) {
 				// Cancel the window unload event
 				e.preventDefault()
 				e.returnValue = ''
@@ -802,7 +837,7 @@ export default {
 		 * Conditions to show the confirmation dialog:
 		 * - The form is active.
 		 * - The form is not currently submitted.
-		 * - There are answers provided in the form.
+		 * - The user changed at least one answer.
 		 *
 		 * If the conditions are met, a confirmation dialog is shown and a promise is returned.
 		 * The promise resolves with the value passed to the confirm button callback.
@@ -811,11 +846,7 @@ export default {
 		 * passed to the confirm button callback if the dialog is shown, otherwise returns true.
 		 */
 		confirmLeaveForm() {
-			if (
-				this.isActive
-				&& !this.submitForm
-				&& Object.keys(this.answers).length !== 0
-			) {
+			if (this.isActive && !this.submitForm && this.answersDirty) {
 				this.showConfirmLeaveDialog = true
 				return new Promise((resolve) => {
 					this.confirmButtonCallback = (val) => {
@@ -895,6 +926,7 @@ export default {
 				}
 				this.submitForm = true
 				this.success = true
+				this.answersDirty = false
 				this.deleteFormFieldFromLocalStorage()
 				emit('forms:last-updated:set', this.form.id)
 			} catch (error) {
@@ -924,6 +956,8 @@ export default {
 		onResetSubmission() {
 			this.deleteFormFieldFromLocalStorage()
 			this.resetData()
+			this.prefillDismissed = true
+			this.answersDirty = true
 		},
 
 		/**
@@ -931,6 +965,8 @@ export default {
 		 */
 		resetData() {
 			this.answers = {}
+			this.answersDirty = false
+			this.prefillDismissed = false
 			this.loading = false
 			this.showConfirmLeaveDialog = false
 			this.showClearFormDialog = false
