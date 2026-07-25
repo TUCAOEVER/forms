@@ -79,4 +79,24 @@ test.describe('Form submission', () => {
 		await submitView.submit()
 		await expect(submitView.successMessage).toBeVisible()
 	})
+
+	test('Prefills an answer from the first matching question name', async ({
+		page,
+		topBar,
+		submitView,
+	}) => {
+		await topBar.toggleView(FormsView.View)
+
+		const submitUrl = new URL(page.url())
+		submitUrl.searchParams.set('prefill[n_Your name]', 'Link Alice')
+		await page.goto(submitUrl.toString())
+
+		const nameInput = submitView.getQuestion('Your name').getByRole('textbox')
+		await expect(nameInput).toHaveValue('Link Alice')
+
+		const response = await submitView.submit()
+		const requestBody = response.request().postDataJSON()
+		expect(Object.values(requestBody.answers)).toContainEqual(['Link Alice'])
+		await expect(submitView.successMessage).toBeVisible()
+	})
 })
