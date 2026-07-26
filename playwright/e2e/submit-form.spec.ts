@@ -99,4 +99,59 @@ test.describe('Form submission', () => {
 		expect(Object.values(requestBody.answers)).toContainEqual(['Link Alice'])
 		await expect(submitView.successMessage).toBeVisible()
 	})
+
+	test('Prefills text from the rendered question order', async ({
+		page,
+		topBar,
+		submitView,
+	}) => {
+		await topBar.toggleView(FormsView.View)
+
+		const submitUrl = new URL(page.url())
+		submitUrl.searchParams.set('prefill[o_1]', 'Position Alice')
+		await page.goto(submitUrl.toString())
+
+		const nameInput = submitView.getQuestion('Your name').getByRole('textbox')
+		await expect(nameInput).toHaveValue('Position Alice')
+
+		const response = await submitView.submit()
+		const requestBody = response.request().postDataJSON()
+		expect(Object.values(requestBody.answers)).toContainEqual(['Position Alice'])
+		await expect(submitView.successMessage).toBeVisible()
+	})
+
+	test('Maps displayed option orders to internal option IDs', async ({
+		page,
+		topBar,
+		submitView,
+	}) => {
+		await topBar.toggleView(FormsView.View)
+
+		const submitUrl = new URL(page.url())
+		submitUrl.searchParams.append('prefill[o_2][]', '1')
+		submitUrl.searchParams.append('prefill[o_2][]', '3')
+		submitUrl.searchParams.set('prefill[o_3]', '2')
+		await page.goto(submitUrl.toString())
+
+		const fruitQuestion = submitView.getQuestion('Favorite fruits')
+		await expect(
+			fruitQuestion.getByRole('checkbox', { name: 'Apple' }),
+		).toBeChecked()
+		await expect(
+			fruitQuestion.getByRole('checkbox', { name: 'Cherry' }),
+		).toBeChecked()
+		await expect(
+			fruitQuestion.getByRole('checkbox', { name: 'Banana' }),
+		).not.toBeChecked()
+		await expect(
+			submitView.getQuestion('Your country').getByRole('combobox'),
+		).toContainText('France')
+
+		const response = await submitView.submit()
+		const requestBody = response.request().postDataJSON()
+		const answerValues = Object.values(requestBody.answers)
+		expect(answerValues).not.toContainEqual(['1', '3'])
+		expect(answerValues).not.toContainEqual(['2'])
+		await expect(submitView.successMessage).toBeVisible()
+	})
 })

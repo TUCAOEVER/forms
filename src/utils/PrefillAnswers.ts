@@ -5,6 +5,8 @@
 
 interface PrefillOption {
 	id: number
+	order?: number
+	optionType?: string
 }
 
 export interface PrefillQuestion {
@@ -29,8 +31,17 @@ const MAX_PREFILL_QUESTIONS = 100
 const MAX_VALUES_PER_QUESTION = 100
 const PREFILL_KEY_PATTERN = /^prefill\[([^\]]+)\](?:\[\])?$/
 const QUESTION_ID_PATTERN = /^q_(\d+)$/
+const QUESTION_ORDER_PATTERN = /^o_([1-9]\d*)$/
+const ORDER_VALUE_PATTERN = /^[1-9]\d*$/
 const QUESTION_NAME_PREFIX = 'n_'
 const SUPPORTED_SINGLE_VALUE_TYPES = new Set(['short', 'long'])
+const OPTION_QUESTION_TYPES = new Set([
+	'multiple',
+	'multiple_unique',
+	'dropdown',
+	'ranking',
+])
+type PrefillQuestionReference = 'id' | 'order' | 'name'
 
 /**
  * Extract supported prefill parameters while preserving their URL order.
@@ -103,6 +114,72 @@ export function resolveQuestionByName(
 	}
 
 	return questions.find((question) => question.text.includes(name))
+}
+
+/**
+ * Resolve an o_<order> parameter against the rendered valid-question order.
+ *
+ * @param questions Questions available on the form
+ * @param key Prefill parameter key
+ */
+export function resolveQuestionByOrder(
+	questions: PrefillQuestion[],
+	key: string,
+): PrefillQuestion | undefined {
+	const match = QUESTION_ORDER_PATTERN.exec(key)
+	if (!match) {
+		return undefined
+	}
+
+	return questions[Number(match[1]) - 1]
+}
+
+/**
+ * Return normal choice options in the same deterministic order as the UI.
+ *
+ * Keep this comparator synchronized with QuestionMultipleMixin.ts.
+ *
+ * @param question Question definition
+ */
+function getSortedOptions(question: PrefillQuestion): PrefillOption[] {
+	return (question.options ?? [])
+		.filter(
+			(option) =>
+				option.optionType === undefined || option.optionType === 'choice',
+		)
+		.slice()
+		.sort((a, b) => {
+			if (a.order === b.order) {
+				return a.id - b.id
+			}
+			return (a.order ?? 0) - (b.order ?? 0)
+		})
+}
+
+/**
+ * Convert strict 1-based displayed option orders into stable option IDs.
+ *
+ * @param question Question definition
+ * @param values Candidate displayed option orders
+ */
+function resolveOptionOrders(
+	question: PrefillQuestion,
+	values: string[],
+): string[] | undefined {
+	if (
+		question.extraSettings?.shuffleOptions === true
+		|| !values.every((value) => ORDER_VALUE_PATTERN.test(value))
+	) {
+		return undefined
+	}
+
+	const options = getSortedOptions(question)
+	const resolved = values.map((value) => options[Number(value) - 1])
+	if (resolved.some((option) => option === undefined)) {
+		return undefined
+	}
+
+	return resolved.map((option) => String(option!.id))
 }
 
 /**
@@ -276,11 +353,13 @@ function normalizeRanking(
  * @param question Question definition
  * @param values Candidate values
  * @param maxAnswerLength Maximum permitted raw answer length
+ * @param reference Question reference type used by the URL parameter
  */
 function normalizeAnswer(
 	question: PrefillQuestion,
 	values: string[],
 	maxAnswerLength: number,
+	reference: PrefillQuestionReference,
 ): string[] | undefined {
 	if (
 		values.length === 0
@@ -293,23 +372,32 @@ function normalizeAnswer(
 		return values.length === 1 ? values : undefined
 	}
 
+	const normalizedValues =
+		reference === 'order' && OPTION_QUESTION_TYPES.has(question.type)
+			? resolveOptionOrders(question, values)
+			: values
+	if (!normalizedValues) {
+		return undefined
+	}
+
 	switch (question.type) {
 		case 'color':
-			return values.length === 1 && /^#[\da-f]{6}$/i.test(values[0])
-				? values
+			return normalizedValues.length === 1
+				&& /^#[\da-f]{6}$/i.test(normalizedValues[0])
+				? normalizedValues
 				: undefined
 		case 'date':
 		case 'datetime':
 		case 'time':
-			return normalizeDateTime(question, values)
+			return normalizeDateTime(question, normalizedValues)
 		case 'multiple':
 		case 'multiple_unique':
 		case 'dropdown':
-			return normalizeOptionValues(question, values)
+			return normalizeOptionValues(question, normalizedValues)
 		case 'linearscale':
-			return normalizeLinearScale(question, values)
+			return normalizeLinearScale(question, normalizedValues)
 		case 'ranking':
-			return normalizeRanking(question, values)
+			return normalizeRanking(question, normalizedValues)
 		default:
 			// File and grid questions are intentionally unsupported.
 			return undefined
@@ -319,8 +407,9 @@ function normalizeAnswer(
 /**
  * Convert URL values into the answer representation consumed by Submit.vue.
  *
- * q_<id> parameters are resolved before n_<text> aliases. LocalStorage priority
- * is applied by Submit.vue after this result has been merged into its state.
+ * URL priority is q_<id>, then o_<order>, then n_<text>. A failed higher
+ * priority value leaves the question available to lower-priority parameters.
+ * LocalStorage priority is applied by Submit.vue after this result is merged.
  *
  * @param questions Questions available on the form
  * @param rawPrefill Parsed prefill parameters
@@ -332,33 +421,41 @@ export function normalizePrefillAnswers(
 	maxAnswerLength: number,
 ): PrefillResult {
 	const answers: Record<number, string[]> = {}
-	const claimedByName = new Set<number>()
+	const claimedQuestionIds = new Set<number>()
 	const orderedPrefill = [
 		...rawPrefill.filter(({ key }) => QUESTION_ID_PATTERN.test(key)),
-		...rawPrefill.filter(({ key }) => !QUESTION_ID_PATTERN.test(key)),
+		...rawPrefill.filter(({ key }) => QUESTION_ORDER_PATTERN.test(key)),
+		...rawPrefill.filter(({ key }) => key.startsWith(QUESTION_NAME_PREFIX)),
 	]
 
 	for (const { key, values } of orderedPrefill) {
-		const byId = QUESTION_ID_PATTERN.test(key)
-		const question = byId
-			? resolveQuestionById(questions, key)
-			: resolveQuestionByName(questions, key)
-		if (
-			!question
-			|| (!byId && (claimedByName.has(question.id) || answers[question.id]))
-		) {
+		const reference: PrefillQuestionReference = QUESTION_ID_PATTERN.test(key)
+			? 'id'
+			: QUESTION_ORDER_PATTERN.test(key)
+				? 'order'
+				: 'name'
+		const question =
+			reference === 'id'
+				? resolveQuestionById(questions, key)
+				: reference === 'order'
+					? resolveQuestionByOrder(questions, key)
+					: resolveQuestionByName(questions, key)
+		if (!question || claimedQuestionIds.has(question.id)) {
 			continue
 		}
 
-		const normalized = normalizeAnswer(question, values, maxAnswerLength)
+		const normalized = normalizeAnswer(
+			question,
+			values,
+			maxAnswerLength,
+			reference,
+		)
 		if (!normalized) {
 			continue
 		}
 
 		answers[question.id] = normalized
-		if (!byId) {
-			claimedByName.add(question.id)
-		}
+		claimedQuestionIds.add(question.id)
 	}
 
 	return {
